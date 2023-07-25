@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-
+import multiprocessing
 import pdfminer.high_level
 import re
 import openai
@@ -30,6 +30,8 @@ from docx import Document
 import mobi
 import pandas as pd
 
+if('translated_pages' in locals()):
+    translated_pages = ['' for _ in range(0, 100)]
 
 def get_docx_title(docx_filename):
     with zipfile.ZipFile(docx_filename) as zf:
@@ -155,8 +157,12 @@ def create_chat_completion(prompt, text, model="gpt-3.5-turbo", **kwargs):
         model=model,
         messages=[
             {
+                "role": "system",
+                "content": f"{prompt}",
+            },
+            {
                 "role": "user",
-                "content": f"{prompt}: \n{text}",
+                "content": f"{text}",
             }
         ],
         **kwargs
@@ -304,13 +310,18 @@ def return_text(text):
     return text
 
 
-# Initialize a count variable of tokens cost.
-cost_tokens = 0
+
 
 
 # 翻译短文本
-def translate_text(text):
-    global cost_tokens
+def translate_text(text, max_tries = 4):
+    if(max_tries <= 0):
+        raise Exception("Gpt could not complete transaction")
+
+    if(len(text.strip())==0):
+        return '', 0
+
+    tokens = 0
 
     # 调用openai的API进行翻译
     try:
@@ -323,43 +334,36 @@ def translate_text(text):
             .decode()
         )
         # Get the token usage from the API response
-        cost_tokens += completion["usage"]["total_tokens"]
+        tokens += completion["usage"]["total_tokens"]
 
     except Exception as e:
         import time
         # TIME LIMIT for open api please pay
-        sleep_time = 60
+        sleep_time = 10
         time.sleep(sleep_time)
         print(e, f"will sleep  {sleep_time} seconds")
+        print("Retrying...")
+        return translate_text(text, max_tries-1)
 
-        completion = create_chat_completion(prompt, text)
-        t_text = (
-            completion["choices"][0]
-            .get("message")
-            .get("content")
-            .encode("utf8")
-            .decode()
-        )
-        # Get the token usage from the API response
-        cost_tokens += completion["usage"]["total_tokens"]
-
-    return t_text
+    return t_text, tokens
 
 
 def translate_and_store(text):
     # 如果文本已经翻译过，直接返回翻译结果
     if text in translated_dict:
-        return translated_dict[text]
+        print("RETURN 1")
+        return translated_dict[text], 0 # 1
 
     # 否则，调用 translate_text 函数进行翻译，并将结果存储在字典中
-    translated_text = translate_text(text)
+    translated_text, cost = translate_text(text)
     translated_dict[text] = translated_text
 
     # 将字典保存为 JSON 文件
     with open(jsonfile, "w", encoding="utf-8") as f:
         json.dump(translated_dict, f, ensure_ascii=False, indent=4)
-
-    return translated_text
+    print(f"SINGEL COST: {cost}")
+    print("RETURN 2")
+    return translated_text, cost
 
 
 def text_replace(long_string, xlsx_path, case_sensitive):
@@ -383,159 +387,205 @@ def text_replace(long_string, xlsx_path, case_sensitive):
     # 返回替换后的字符串
     return long_string
 
+def translate_page(id, item):
+    print(f"STARTING ITEM {id}")
+    # 如果章节类型为文档类型，则需要翻译
+    if item.get_type() == ebooklib.ITEM_DOCUMENT:
+        # 使用BeautifulSoup提取原文本
+        soup = BeautifulSoup(item.get_content(), 'html.parser')
+        text = soup.get_text().strip()
+        # 如果原文本为空，则跳过
+        if not text:
+            #continue
+            return (id, '', 0)
+        # 将所有回车替换为空格
+        text = text.replace("\n", " ")
+        # 将多个空格替换为一个空格
+        import re
+        text = re.sub(r"\s+", " ", text)
+        # 如果设置了译名表替换，则对文本进行翻译前的替换
+        if args.tlist:
+            text = text_replace(text, transliteration_list_file, case_matching)
+        # 将文本分成不大于1024字符的短文本list
+        short_text_list = split_text(text)
+        if args.test:
+            short_text_list = short_text_list[:3]
+        # 初始化翻译后的文本
+        translated_text = ""
+        page_tokens = 0
+        # 遍历短文本列表，依次翻译每个短文本
+        for short_text in tqdm(short_text_list): # Parallelisera!
+            print("\n---------------------------------------\n")
+            print(f"original text: {return_text(short_text)}")
+            #count += 1
+            # 翻译当前短文本
+            translated_short_text, cost = translate_and_store(short_text)
 
-text = ""
+            page_tokens += cost
 
-# 根据文件类型调用相应的函数
-if filename.endswith('.pdf'):
-    print("Converting PDF to text")
-    title = get_pdf_title(filename)
-    with tqdm(total=10, desc="Converting PDF to text") as pbar:
-        for i in range(10):
-            text = convert_pdf_to_text(filename, startpage, endpage)
+            short_text = return_text(short_text)
+            translated_short_text = return_text(translated_short_text)
+            # 将当前短文本和翻译后的文本加入总文本中
+            if bilingual_output.lower() == 'true':
+                translated_text += f"{short_text}<br>\n{translated_short_text}<br>\n"
+            else:
+                translated_text += f"{translated_short_text}<br>\n"
+            print(f"translation of text: {translated_short_text}")
+        # 使用翻译后的文本替换原有的章节内容
+        #item.set_content((img_html + translated_text.replace('\n', '<br>')).encode('utf-8'))
+        print(f"FINNISHED ITEM {id}")
+        return (id, translated_text, page_tokens)
+    
+    #if it is not a translatable page, return en empty string
+    return (id, '', 0)
+
+
+
+def start_conversion():
+    # Initalize list (to avoid threading problems?)
+    global translated_pages 
+    translated_pages = ['' for _ in range(0, 100)]
+    text = ""
+    # 根据文件类型调用相应的函数
+    if filename.endswith('.pdf'):
+        print("Converting PDF to text")
+        title = get_pdf_title(filename)
+        with tqdm(total=10, desc="Converting PDF to text") as pbar:
+            for i in range(10):
+                text = convert_pdf_to_text(filename, startpage, endpage)
+                pbar.update(1)
+    elif filename.endswith('.epub'):
+        print("Converting epub to text")
+        book = epub.read_epub(filename)
+    elif filename.endswith('.txt'):
+
+        with open(filename, 'r', encoding='utf-8') as file:
+            text = file.read()
+
+        title = os.path.basename(filename)
+    elif filename.endswith('.docx'):
+        print("Converting DOCX file to text")
+        title = get_docx_title(filename)
+        with tqdm(total=10, desc="Converting DOCX to text") as pbar:
+            for i in range(10):
+                text = convert_docx_to_text(filename)
+                pbar.update(1)
+
+    elif filename.endswith('.mobi'):
+        print("Converting MOBI file to text")
+        title = get_mobi_title(filename)
+        with tqdm(total=10, desc="Converting MOBI to text") as pbar:
+            for i in range(10):
+                text = convert_mobi_to_text(filename)
+                pbar.update(1)
+    else:
+        print("Unsupported file type")
+
+    if filename.endswith('.epub'):
+        # 获取所有章节
+        items = book.get_items()
+
+        # 遍历所有章节
+        translated_all = ''
+        #count = 0
+        items = [i for i in items][0:5] # test
+        total_items = len(items)
+        print(f"Total items: {total_items}")
+        translation_tasks = list(zip(range(1, 1+total_items), items))
+        print(f"Translations tasks: ")
+        for x in translation_tasks:
+            print(f"({x[0]}, {x[1]})")
+        
+
+        print(f"Starting pooling... {len(list(translation_tasks))}")
+        #for tup in list(translation_tasks):
+        #    print("KÖR DEN ENS DET HÄR?")
+        #    translate_page(tup[0], tup[1])
+        total_tokens = 0
+
+        with multiprocessing.Pool(3) as pool:
+            # call the function for each item in parallel with multiple arguments
+            for result in pool.starmap(translate_page, translation_tasks):
+                # SET VALUES
+                id = result[0]
+                translation = result[1]
+                page_tokens = result[2]
+                item = items[id-1]
+                
+                #Thread safe?
+                total_tokens += page_tokens
+
+                soup = BeautifulSoup(item.get_content(), 'html.parser')
+                text = soup.get_text().strip()
+                img_html = ''
+                img_tags = soup.find_all('img')
+                for img_tag in img_tags:
+                    img_html += str(img_tag) + '<br>'
+
+                translated_pages[id] = translation
+                item.set_content((img_html + translation.replace('\n', '<br>')).encode('utf-8'))
+            pool.close()
+            pool.join()
+        print(f"Finnished pooling: {translated_pages}")
+        translated_all = ''.join(translated_pages)
+        # 将epub书籍写入文件
+        epub.write_epub(new_filename, book, {})
+        # 将翻译后的文本同时写入txt文件 in case epub插件出问题
+        with open(new_filenametxt, "w", encoding="utf-8") as f:
+            f.write(translated_all)
+
+    else:
+        # 将所有回车替换为空格
+        text = text.replace("\n", " ")
+
+        # 将多个空格替换为一个空格
+        import re
+
+        text = re.sub(r"\s+", " ", text)
+
+        # 如果设置了译名表替换，则对文本进行翻译前的替换
+        if args.tlist:
+            text = text_replace(text, transliteration_list_file, case_matching)
+
+        # 将文本分成不大于1024字符的短文本list
+        short_text_list = split_text(text)
+        if args.test:
+            short_text_list = short_text_list[:3]
+        # 初始化翻译后的文本
+        translated_text = ""
+
+        # 遍历短文本列表，依次翻译每个短文本
+        for short_text in tqdm(short_text_list):
+            print(return_text(short_text))
+            # 翻译当前短文本
+            translated_short_text, cost = translate_and_store(short_text)
+            short_text = return_text(short_text)
+            translated_short_text = return_text(translated_short_text)
+            # 将当前短文本和翻译后的文本加入总文本中
+            if bilingual_output.lower() == 'true':
+                translated_text += f"{short_text}\n{translated_short_text}\n"
+            else:
+                translated_text += f"{translated_short_text}\n"
+            # print(short_text)
+            print(translated_short_text)
+
+        # 将翻译后的文本写入epub文件
+        with tqdm(total=10, desc="Writing translated text to epub") as pbar:
+            text_to_epub(translated_text.replace('\n', '<br>'), new_filename, language_code, title)
             pbar.update(1)
-elif filename.endswith('.epub'):
-    print("Converting epub to text")
-    book = epub.read_epub(filename)
-elif filename.endswith('.txt'):
 
-    with open(filename, 'r', encoding='utf-8') as file:
-        text = file.read()
+        # 将翻译后的文本同时写入txt文件 in case epub插件出问题
+        with open(new_filenametxt, "w", encoding="utf-8") as f:
+            f.write(translated_text)
+    cost = total_tokens / 1000 * 0.002
+    print(f"Translation completed. Total cost: {total_tokens} tokens, ${cost}.")
 
-    title = os.path.basename(filename)
-elif filename.endswith('.docx'):
-    print("Converting DOCX file to text")
-    title = get_docx_title(filename)
-    with tqdm(total=10, desc="Converting DOCX to text") as pbar:
-        for i in range(10):
-            text = convert_docx_to_text(filename)
-            pbar.update(1)
+    try:
+        os.remove(jsonfile)
+        print(f"File '{jsonfile}' has been deleted.")
+    except FileNotFoundError:
+        print(f"File '{jsonfile}' not found. No file was deleted.")
 
-elif filename.endswith('.mobi'):
-    print("Converting MOBI file to text")
-    title = get_mobi_title(filename)
-    with tqdm(total=10, desc="Converting MOBI to text") as pbar:
-        for i in range(10):
-            text = convert_mobi_to_text(filename)
-            pbar.update(1)
-else:
-    print("Unsupported file type")
-
-if filename.endswith('.epub'):
-    # 获取所有章节
-    items = book.get_items()
-
-    # 遍历所有章节
-    translated_all = ''
-    count = 0
-    for item in tqdm(items):
-        # 如果章节类型为文档类型，则需要翻译
-        if item.get_type() == ebooklib.ITEM_DOCUMENT:
-            # 使用BeautifulSoup提取原文本
-            soup = BeautifulSoup(item.get_content(), 'html.parser')
-            text = soup.get_text().strip()
-            img_html = ''
-            img_tags = soup.find_all('img')
-            for img_tag in img_tags:
-                img_html += str(img_tag) + '<br>'
-            # 如果原文本为空，则跳过
-            if not text:
-                continue
-            # 将所有回车替换为空格
-            text = text.replace("\n", " ")
-
-            # 将多个空格替换为一个空格
-            import re
-
-            text = re.sub(r"\s+", " ", text)
-
-            # 如果设置了译名表替换，则对文本进行翻译前的替换
-            if args.tlist:
-                text = text_replace(text, transliteration_list_file, case_matching)
-
-            # 将文本分成不大于1024字符的短文本list
-            short_text_list = split_text(text)
-            if args.test:
-                short_text_list = short_text_list[:3]
-
-            # 初始化翻译后的文本
-            translated_text = ""
-
-            # 遍历短文本列表，依次翻译每个短文本
-            for short_text in tqdm(short_text_list):
-                print(return_text(short_text))
-                count += 1
-                # 翻译当前短文本
-                translated_short_text = translate_and_store(short_text)
-                short_text = return_text(short_text)
-                translated_short_text = return_text(translated_short_text)
-                # 将当前短文本和翻译后的文本加入总文本中
-                if bilingual_output.lower() == 'true':
-                    translated_text += f"{short_text}<br>\n{translated_short_text}<br>\n"
-                else:
-                    translated_text += f"{translated_short_text}<br>\n"
-                # print(short_text)
-                print(translated_short_text)
-            # 使用翻译后的文本替换原有的章节内容
-            item.set_content((img_html + translated_text.replace('\n', '<br>')).encode('utf-8'))
-            translated_all += translated_text
-            if args.test and count >= 3:
-                break
-
-    # 将epub书籍写入文件
-    epub.write_epub(new_filename, book, {})
-    # 将翻译后的文本同时写入txt文件 in case epub插件出问题
-    with open(new_filenametxt, "w", encoding="utf-8") as f:
-        f.write(translated_all)
-
-else:
-    # 将所有回车替换为空格
-    text = text.replace("\n", " ")
-
-    # 将多个空格替换为一个空格
-    import re
-
-    text = re.sub(r"\s+", " ", text)
-
-    # 如果设置了译名表替换，则对文本进行翻译前的替换
-    if args.tlist:
-        text = text_replace(text, transliteration_list_file, case_matching)
-
-    # 将文本分成不大于1024字符的短文本list
-    short_text_list = split_text(text)
-    if args.test:
-        short_text_list = short_text_list[:3]
-    # 初始化翻译后的文本
-    translated_text = ""
-
-    # 遍历短文本列表，依次翻译每个短文本
-    for short_text in tqdm(short_text_list):
-        print(return_text(short_text))
-        # 翻译当前短文本
-        translated_short_text = translate_and_store(short_text)
-        short_text = return_text(short_text)
-        translated_short_text = return_text(translated_short_text)
-        # 将当前短文本和翻译后的文本加入总文本中
-        if bilingual_output.lower() == 'true':
-            translated_text += f"{short_text}\n{translated_short_text}\n"
-        else:
-            translated_text += f"{translated_short_text}\n"
-        # print(short_text)
-        print(translated_short_text)
-
-    # 将翻译后的文本写入epub文件
-    with tqdm(total=10, desc="Writing translated text to epub") as pbar:
-        text_to_epub(translated_text.replace('\n', '<br>'), new_filename, language_code, title)
-        pbar.update(1)
-
-    # 将翻译后的文本同时写入txt文件 in case epub插件出问题
-    with open(new_filenametxt, "w", encoding="utf-8") as f:
-        f.write(translated_text)
-cost = cost_tokens / 1000 * 0.002
-print(f"Translation completed. Total cost: {cost_tokens} tokens, ${cost}.")
-
-try:
-    os.remove(jsonfile)
-    print(f"File '{jsonfile}' has been deleted.")
-except FileNotFoundError:
-    print(f"File '{jsonfile}' not found. No file was deleted.")
+if __name__ == '__main__':
+    print("python isn't supid...")
+    start_conversion()
