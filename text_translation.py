@@ -488,7 +488,7 @@ def start_conversion():
         # 遍历所有章节
         translated_all = ''
         #count = 0
-        items = [i for i in items][0:5] # test
+        items = [i for i in items]
         total_items = len(items)
         print(f"Total items: {total_items}")
         translation_tasks = list(zip(range(1, 1+total_items), items))
@@ -503,7 +503,7 @@ def start_conversion():
         #    translate_page(tup[0], tup[1])
         total_tokens = 0
 
-        with multiprocessing.Pool(3) as pool:
+        with multiprocessing.Pool(6) as pool:
             # call the function for each item in parallel with multiple arguments
             for result in pool.starmap(translate_page, translation_tasks):
                 # SET VALUES
@@ -511,19 +511,19 @@ def start_conversion():
                 translation = result[1]
                 page_tokens = result[2]
                 item = items[id-1]
-                
-                #Thread safe?
-                total_tokens += page_tokens
-
-                soup = BeautifulSoup(item.get_content(), 'html.parser')
-                text = soup.get_text().strip()
-                img_html = ''
-                img_tags = soup.find_all('img')
-                for img_tag in img_tags:
-                    img_html += str(img_tag) + '<br>'
-
-                translated_pages[id] = translation
-                item.set_content((img_html + translation.replace('\n', '<br>')).encode('utf-8'))
+                # Change the pages content if it is a ITEM_DOCUMENT (eg skip images and so on)
+                if item.get_type() == ebooklib.ITEM_DOCUMENT:
+                    #Thread safe?
+                    total_tokens += page_tokens
+                    soup = BeautifulSoup(item.get_content(), 'html.parser')
+                    text = soup.get_text().strip()
+                    img_html = ''
+                    img_tags = soup.find_all('img')
+                    for img_tag in img_tags:
+                        img_html += str(img_tag) + '<br>'
+                    translated_pages[id] = translation
+                    item.set_content((img_html + translation.replace('\n', '<br>')).encode('utf-8'))
+            
             pool.close()
             pool.join()
         print(f"Finnished pooling: {translated_pages}")

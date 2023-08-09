@@ -3,6 +3,7 @@
 *.epub
 *.txt
 !requirements.txt
+*.cfg
 
 # config
 settings.cfg
